@@ -1,4 +1,155 @@
 MIT License
+import ccxt
+import pandas as pd
+import time
+from datetime import datetime
+import numpy as np
+
+class CrossMarketAgent:
+    def __init__(self, api_key: str, api_secret: str, passphrase: str = ""):
+        # Bitget 合约需要 passphrase，现货可空
+        self.exchange = ccxt.bitget({
+            'apiKey': api_key,
+            'secret': api_secret,
+            'password': passphrase,
+            'enableRateLimit': True,  # 强制限流防封禁
+            'options': {'defaultType': 'swap'}  # USDT永续合约
+        })
+        # 交易日志表
+        self.history = pd.DataFrame(columns=['time', 'action', 'reason', 'size', 'pnl'])
+        self.symbol = "BTC/USDT:USDT"
+        self.timeframe = "15m"
+
+    def calculate_rsi(self, ohlcv, period=14):
+        """ohlcv: [[timestamp, open, high, low, close, volume]]"""
+        closes = np.array([x[4] for x in ohlcv])
+        delta = np.diff(closes)
+        gain = np.where(delta > 0, delta, 0)
+        loss = np.where(delta < 0, -delta, 0)
+
+        avg_gain = pd.Series(gain).rolling(window=period).mean()
+        avg_loss = pd.Series(loss).rolling(window=period).mean()
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        return float(rsi.iloc[-1])  # 返回最新一根K线RSI
+
+    def get_twitter_sentiment(self, query: str) -> float:
+        """空壳函数，对接X/Twitter情绪API后替换，范围 [-1,1]"""
+        # 模拟返回，真实环境调用sentiment库/第三方接口
+        return 0.2
+
+    def get_onchain_signal(self) -> str:
+        """空壳链上信号：bullish / bearish / neutral"""
+        # 可对接Glassnode、Dune、TokenTerminal API
+        return "neutral"
+
+    def perceive(self):
+        """感知层：行情+技术面+情绪+链上"""
+        ohlcv = self.exchange.fetch_ohlcv(self.symbol, self.timeframe, limit=100)
+        rsi = self.calculate_rsi(ohlcv)
+        sentiment_score = self.get_twitter_sentiment("BTC OR bitcoin lang:en")
+        onchain = self.get_onchain_signal()
+        return {"rsi": rsi, "sentiment_score": sentiment_score, "onchain": onchain}
+
+    def decide(self, signals):
+        """决策层打分机制"""
+        score = 0
+        reasons = []
+        rsi = signals["rsi"]
+        sent = signals["sentiment_score"]
+        chain = signals["onchain"]
+
+        if rsi < 40:
+            score += 30
+            reasons.append(f"RSI超卖({round(rsi,1)})")
+        elif rsi > 70:
+            score -= 30
+            reasons.append(f"RSI超买({round(rsi,1)})")
+
+        if sent > 0.6:
+            score += 40
+            reasons.append(f"市场正面情绪({sent:.2f})")
+        elif sent < -0.4:
+            score -= 40
+            reasons.append(f"市场负面情绪({sent:.2f})")
+
+        if chain == "bullish":
+            score += 30
+            reasons.append("链上大额净流入看涨")
+        elif chain == "bearish":
+            score -= 30
+            reasons.append("链上大额转出看跌")
+
+        # 仓位控制：分数越高仓位越大
+        if score > 70:
+            return "BUY", reasons, 0.05  # 账户5%资金做多
+        elif score < -20:
+            return "SELL", reasons, 0.03  # 账户3%资金做空
+        return "HOLD", reasons, 0.0
+
+    def get_available_balance(self):
+        """获取USDT可用余额，用于换算下单数量"""
+        balance = self.exchange.fetch_balance()
+        return float(balance["USDT"]["free"])
+
+    def execute(self, action, size_ratio):
+        """执行交易，增加风控判断"""
+        if size_ratio <= 0:
+            return
+        bal = self.get_available_balance()
+        price = self.exchange.fetch_ticker(self.symbol)["last"]
+        amount_usdt = bal * size_ratio
+        coin_amount = amount_usdt / price  # BTC数量
+
+        try:
+            if action == "BUY":
+                order = self.exchange.create_market_buy_order(self.symbol, coin_amount)
+            elif action == "SELL":
+                order = self.exchange.create_market_sell_order(self.symbol, coin_amount)
+            print(f"订单成交: {order['id']} | {action} {coin_amount:.4f} BTC")
+            self.log_trade(action, size_ratio, "成交成功", 0)
+        except Exception as e:
+            print(f"下单失败: {str(e)}")
+            self.log_trade(action, size_ratio, f"失败:{str(e)}", 0)
+
+    def log_trade(self, action, size, reason, pnl):
+        """写入交易日志DataFrame"""
+        new_row = pd.DataFrame([{
+            "time": datetime.now(),
+            "action": action,
+            "reason": reason,
+            "size": size,
+            "pnl": pnl
+        }])
+        self.history = pd.concat([self.history, new_row], ignore_index=True)
+        # 持久化日志到csv
+        self.history.to_csv("trade_log.csv", index=False, encoding="utf-8")
+
+    def run_cycle(self):
+        """单次策略循环"""
+        try:
+            signals = self.perceive()
+            action, reasons, size = self.decide(signals)
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"\n[{now}] 信号数据: {signals}")
+            print(f"决策: {action} | 依据: {reasons} | 仓位比例: {size}")
+            # self.execute(action, size)  # 实盘开启前注释
+        except Exception as e:
+            print(f"策略循环异常: {str(e)}")
+
+if __name__ == "__main__":
+    # 填入Bitget API信息，测试网优先
+    API_KEY = "YOUR_API_KEY"
+    API_SECRET = "YOUR_API_SECRET"
+    API_PASSPHRASE = "YOUR_PASSPHRASE"
+
+    agent = CrossMarketAgent(API_KEY, API_SECRET, API_PASSPHRASE)
+    cycle_interval = 15 * 60  # 15分钟跑一轮，匹配15mK线
+
+    print("多市场量化代理启动，每15分钟执行一轮...")
+    while True:
+        agent.run_cycle()
+        time.sleep(cycle_interval)
 
 Copyright (c) 2026 tangmikelusen-web
 
